@@ -122,11 +122,18 @@ def init_train_state(
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # Build per-parameter sharding spec for partial_params so each device only
+    # receives the shard it owns, instead of replicating the full weights to all devices.
+    params_sharding_dict = state_sharding.params.to_pure_dict()
+    flat_partial = traverse_util.flatten_dict(partial_params)
+    flat_sharding = traverse_util.flatten_dict(params_sharding_dict)
+    partial_params_sharding = traverse_util.unflatten_dict({k: flat_sharding[k] for k in flat_partial})
+
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
         donate_argnums=(1,),  # donate the partial params buffer.
-        in_shardings=replicated_sharding,
+        in_shardings=(replicated_sharding, partial_params_sharding),
         out_shardings=state_sharding,
     )(init_rng, partial_params)
 

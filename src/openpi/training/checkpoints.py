@@ -9,6 +9,7 @@ from typing import Protocol
 from etils import epath
 import jax
 import orbax.checkpoint as ocp
+import orbax.checkpoint._src.serialization.type_handlers as _type_handlers
 import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
@@ -36,6 +37,14 @@ def initialize_checkpoint_dir(
             )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Disable replica-parallel serialization to avoid device mismatch on multi-GPU setups.
+    # See: https://github.com/google/orbax/issues - buffer on cuda:0 but replica assigned to cuda:1.
+    _type_handlers.register_type_handler(
+        jax.Array,
+        _type_handlers.ArrayHandler(use_replica_parallel=False),
+        override=True,
+    )
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,

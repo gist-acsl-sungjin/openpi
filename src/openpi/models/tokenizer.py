@@ -1,11 +1,17 @@
 import logging
 import os
+import pathlib
 
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
 import sentencepiece
+from scipy.fft import idct
 from transformers import AutoProcessor
+
+# Flag file touched by the server when a FAST token decode error occurs.
+# The eval client checks this file to classify episodes as clean vs. warned.
+FAST_DECODE_WARNING_FLAG = "/tmp/openpi_fast_decode_warning"
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
@@ -129,9 +135,19 @@ class FASTTokenizer:
             self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
         )
         action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
-        return self._fast_tokenizer.decode(
-            [action_tokens.tolist()], time_horizon=action_horizon, action_dim=action_dim
-        )[0]
+
+        # Replicate fast_tokenizer.decode() with flag file on failure (original zeros behavior preserved).
+        fast = self._fast_tokenizer
+        try:
+            decoded_chars = fast.bpe_tokenizer.decode(action_tokens.tolist())
+            dct_coeff = np.array(list(map(ord, decoded_chars))) + fast.min_token
+            dct_coeff = dct_coeff.reshape(-1, action_dim)
+            assert dct_coeff.shape == (action_horizon, action_dim)
+            return idct(dct_coeff / fast.scale, axis=0, norm="ortho").astype(np.float32)
+        except Exception as e:
+            logging.warning(f"Error decoding tokens: {e}")
+            pathlib.Path(FAST_DECODE_WARNING_FLAG).touch()
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
 
     def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
         if isinstance(tokens, list):

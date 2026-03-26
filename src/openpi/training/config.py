@@ -90,6 +90,9 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Local directory for LeRobot dataset. If set, overrides the default HuggingFace cache location.
+    local_data_dir: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -207,6 +210,40 @@ class FakeDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         return DataConfig(repo_id=self.repo_id)
+
+
+@dataclasses.dataclass(frozen=True)
+class SSv2DataConfig(DataConfigFactory):
+    """Data config for SS-v2 physical understanding pre-training."""
+
+    repo_id: str = "ssv2"
+    # Path to filtered_train.json
+    labels_path: str = tyro.MISSING
+    # Path to pre-extracted frames directory
+    frames_dir: str = tyro.MISSING
+    # Image input mode: "3frame" (start+middle+end), "2frame" (start+end), "start", "end"
+    input_mode: str = "3frame"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        assert model_config.model_type == _model.ModelType.PI0_FAST, "SSv2DataConfig only supports PI0_FAST"
+        tokenizer_cls = (
+            _tokenizer.FASTTokenizer
+            if model_config.fast_model_tokenizer is None
+            else model_config.fast_model_tokenizer
+        )
+        tokenizer_kwargs = model_config.fast_model_tokenizer_kwargs or {}
+        return DataConfig(
+            repo_id=self.repo_id,
+            model_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizeSSv2Inputs(
+                        tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                    ),
+                ]
+            ),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -347,6 +384,74 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoCoTDataConfig(DataConfigFactory):
+    """Like LeRobotLiberoDataConfig but injects chain-of-thought reasoning from cot_simple.json.
+
+    Reasoning text (updated_content_w_instruction) is prepended to the action tokens in the
+    token sequence.  Both reasoning and action tokens are supervised (loss_mask=True).
+
+    Token layout per step:
+        Prefix  (ar_mask=0, loss=False): [BOS] "Task: {task}, State: {state};\n"
+        CoT     (ar_mask=1, loss=True):  "Reasoning: {reasoning}\n"
+        Action  (ar_mask=1, loss=True):  "Action: " + [FAST tokens] + "|" [EOS]
+    """
+
+    cot_json_path: str = ""  # Absolute path to cot_simple.json (required)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Pass episode_index and frame_index through repack so InjectCoTReasoning can use them.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "episode_index": "episode_index",
+                        "frame_index": "frame_index",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                # InjectCoTReasoning must run first — it needs episode_index and frame_index
+                # which LiberoInputs would otherwise drop (LiberoInputs returns a fresh dict).
+                # KeepKeys then wraps LiberoInputs to preserve 'reasoning' in its output.
+                _transforms.InjectCoTReasoning(cot_json_path=self.cot_json_path),
+                _transforms.KeepKeys(
+                    inner=libero_policy.LiberoInputs(model_type=model_config.model_type),
+                    keep=("reasoning",),
+                ),
+            ],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        # Use CoT-aware tokenizer instead of the default ModelTransformFactory.
+        # max_token_len is bumped to 350 to accommodate reasoning text (~100 extra tokens).
+        fast_tokenizer = _tokenizer.FASTTokenizer(max_len=model_config.max_token_len)
+        model_transforms = _transforms.Group(
+            inputs=[_transforms.TokenizeFASTCoTInputs(tokenizer=fast_tokenizer)],
+            outputs=[_transforms.ExtractFASTActions(
+                tokenizer=fast_tokenizer,
+                action_horizon=model_config.action_horizon,
+                action_dim=model_config.action_dim,
+            )],
+        )
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -964,6 +1069,225 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    #
+    # SS-v2 physical understanding pre-training config.
+    #
+    TrainConfig(
+        name="pi0_fast_ssv2",
+        model=pi0_fast.Pi0FASTConfig(
+            # SS-v2 has no robot actions; we reuse the action slots as dummy tokens.
+            # Keeping dims consistent with pi0-FAST base so weights transfer cleanly.
+            action_dim=32,
+            action_horizon=32,
+            # Token budget breakdown:
+            #   prefix template (fixed) : ~50 tokens
+            #   prompt label            : ~15 tokens (avg SS-v2 label)
+            #   postfix "Answer: no..." : ~20 tokens (worst case with correct_label)
+            #   total                   : ~85 tokens → 160 gives comfortable headroom
+            max_token_len=160,
+            # LoRA on PaliGemma backbone (rank=16, alpha=16 — hardcoded in gemma.py).
+            # Keeps action-generation capability intact; Stage 1 is a soft prior only.
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=SSv2DataConfig(
+            repo_id="ssv2",
+            labels_path="openpi/ss-v2/labels/filtered_train.json",
+            frames_dir="datasets/20bn-something-something-v2-frames",
+            input_mode="3frame",  # start → base_0_rgb, middle → base_1_rgb, end → base_2_rgb
+        ),
+        # Start from pi0-FAST base; language + vision backbone already pretrained.
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        # Freeze all LLM non-LoRA params; only LoRA adapters are trained.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=32,
+            action_horizon=32,
+            max_token_len=160,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        # LR schedule: short warmup, then cosine decay.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # fsdp_devices=8: shard parameters across all 8 GPUs (default=1 replicates fully).
+        # batch_size=64: activation memory scales with batch, keep conservative with 3 frames.
+        fsdp_devices=4,
+        batch_size=64,
+        num_train_steps=5_000,
+        save_interval=1000,
+        keep_period=1000,
+        # EMA is not useful for LoRA fine-tuning (adapters are small, EMA adds overhead).
+        ema_decay=None,
+        wandb_enabled=True,
+        project_name="vla-hard-negative",
+    ),
+    #
+    # Stage 2: libero-10-r fine-tuning configs for hypothesis validation.
+    #
+    # Shared settings:
+    #   - pi0-FAST backbone LoRA rank 16 (same as Stage 1) → direct weight transfer from Stage 1 checkpoint
+    #   - Action head: fully trainable (freeze_filter only covers llm.* non-lora params)
+    #   - 25k steps for quick direction check (A vs C comparison)
+    #   - Lower LR than Stage 1 to protect backbone
+    #
+    # Variant A — baseline: pi0-FAST base → libero-10-r
+    TrainConfig(
+        name="pi0_fast_libero_r_A",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero-10-r",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_data_dir="/home/main/storage/sungjin/datasets/libero-10-r",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=25_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        fsdp_devices=4,
+        batch_size=32,
+        num_train_steps=25_000,
+        save_interval=1000,
+        keep_period=1000,
+        ema_decay=None,
+        wandb_enabled=True,
+        project_name="vla-hard-negative",
+    ),
+    # Variant C — Stage 1 A2L pretraining → libero-10-r
+    # Weight path points to Stage 1 LoRA checkpoint (update step number after Stage 1 completes).
+    TrainConfig(
+        name="pi0_fast_libero_r_C",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero-10-r",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_data_dir="/home/main/storage/sungjin/datasets/libero-10-r",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi0_fast_ssv2/ssv2_a2l_v1/9999/params"
+        ),
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=25_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        fsdp_devices=4,
+        batch_size=32,
+        num_train_steps=25_000,
+        save_interval=1000,
+        keep_period=1000,
+        ema_decay=None,
+        wandb_enabled=True,
+        project_name="vla-hard-negative",
+    ),
+    # Variant B — CoT training: pi0-FAST base → libero-10-r with chain-of-thought reasoning
+    TrainConfig(
+        name="pi0_fast_libero_r_B",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=350,  # Extra headroom for reasoning text (~100 tokens)
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotLiberoCoTDataConfig(
+            repo_id="libero-10-r",
+            cot_json_path="/home/main/storage/sungjin/datasets/libero-10-r/cot_simple.json",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_data_dir="/home/main/storage/sungjin/datasets/libero-10-r",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=350, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=25_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        fsdp_devices=8,
+        batch_size=32,
+        num_train_steps=25_000,
+        save_interval=1000,
+        keep_period=1000,
+        ema_decay=None,
+        wandb_enabled=True,
+        project_name="vla-hard-negative",
+    ),
+    # Variant D — CoT training: Stage1-A2L → libero-10-r with chain-of-thought reasoning
+    TrainConfig(
+        name="pi0_fast_libero_r_D",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=350,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=LeRobotLiberoCoTDataConfig(
+            repo_id="libero-10-r",
+            cot_json_path="/home/main/storage/sungjin/datasets/libero-10-r/cot_simple.json",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_data_dir="/home/main/storage/sungjin/datasets/libero-10-r",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi0_fast_ssv2/ssv2_a2l_v1/9999/params"
+        ),
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=350, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=25_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        fsdp_devices=8,
+        batch_size=32,
+        num_train_steps=25_000,
+        save_interval=1000,
+        keep_period=1000,
+        ema_decay=None,
+        wandb_enabled=True,
+        project_name="vla-hard-negative",
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

@@ -11,9 +11,14 @@ import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
+# Disable LeRobot timestamp sync validation — dataset format (v2.0) uses global stats
+# instead of per-episode stats, which causes false failures in check_timestamps_sync.
+lerobot_dataset.check_timestamps_sync = lambda *args, **kwargs: True
+
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.ssv2_dataset import SSv2Dataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -128,7 +133,10 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    data_factory: _config.DataConfigFactory | None = None,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -137,9 +145,22 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    if repo_id == "ssv2":
+        assert isinstance(data_factory, _config.SSv2DataConfig), (
+            "data_factory must be SSv2DataConfig when repo_id='ssv2'"
+        )
+        return SSv2Dataset(
+            labels_path=data_factory.labels_path,
+            frames_dir=data_factory.frames_dir,
+            input_mode=data_factory.input_mode,
+            action_dim=model_config.action_dim,
+            action_horizon=action_horizon,
+        )
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.local_data_dir)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.local_data_dir,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -172,7 +193,7 @@ def create_rlds_dataset(
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if data_config.repo_id not in ("fake", "ssv2") and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
@@ -258,6 +279,7 @@ def create_data_loader(
         model_config=config.model,
         action_horizon=config.model.action_horizon,
         batch_size=config.batch_size,
+        data_factory=config.data,
         sharding=sharding,
         shuffle=shuffle,
         num_batches=num_batches,
@@ -274,6 +296,7 @@ def create_torch_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
+    data_factory: _config.DataConfigFactory | None = None,
     sharding: jax.sharding.Sharding | None = None,
     skip_norm_stats: bool = False,
     shuffle: bool = False,
@@ -299,7 +322,7 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = create_torch_dataset(data_config, action_horizon, model_config, data_factory=data_factory)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

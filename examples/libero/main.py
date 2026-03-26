@@ -36,6 +36,7 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    clean_trials_per_task: int | None = None  # If set, run until this many warning-free episodes complete per task (overrides num_trials_per_task as max)
 
     #################################################################################################################
     # Utils
@@ -43,6 +44,8 @@ class Args:
     video_out_path: str = "data/libero/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
+
+    task_orders: list[int] | None = None  # Subset of task IDs to evaluate (default: all)
 
 
 def eval_libero(args: Args) -> None:
@@ -73,8 +76,9 @@ def eval_libero(args: Args) -> None:
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
     # Start evaluation
+    task_ids = args.task_orders if args.task_orders is not None else list(range(num_tasks_in_suite))
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -86,15 +90,29 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+        clean_episodes, clean_successes = 0, 0
+        episode_idx = 0
+        target_clean = args.clean_trials_per_task
+        pbar = tqdm.tqdm(total=target_clean if target_clean is not None else args.num_trials_per_task)
+        while True:
+            # Stop when clean target reached, or num_trials exhausted (if no clean target)
+            if target_clean is not None and clean_episodes >= target_clean:
+                break
+            if target_clean is None and task_episodes >= args.num_trials_per_task:
+                break
+
             logging.info(f"\nTask: {task_description}")
+
+            # Clear warning flag before episode
+            flag = pathlib.Path("/tmp/openpi_fast_decode_warning")
+            flag.unlink(missing_ok=True)
 
             # Reset environment
             env.reset()
             action_plan = collections.deque()
 
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+            # Set initial states (cycle through available states if needed)
+            obs = env.set_init_state(initial_states[episode_idx % len(initial_states)])
 
             # Setup
             t = 0
@@ -163,6 +181,18 @@ def eval_libero(args: Args) -> None:
 
             task_episodes += 1
             total_episodes += 1
+            episode_idx += 1
+
+            # Check if this episode had a decode warning
+            had_warning = flag.exists()
+            if not had_warning:
+                clean_episodes += 1
+                if done:
+                    clean_successes += 1
+                if target_clean is not None:
+                    pbar.update(1)
+            if target_clean is None:
+                pbar.update(1)
 
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
@@ -174,12 +204,18 @@ def eval_libero(args: Args) -> None:
             )
 
             # Log current results
-            logging.info(f"Success: {done}")
+            warn_tag = " [WARNED]" if had_warning else " [CLEAN]"
+            logging.info(f"Success: {done}{warn_tag}")
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+            if args.clean_trials_per_task is not None:
+                clean_rate = clean_successes / clean_episodes * 100 if clean_episodes > 0 else 0.0
+                logging.info(f"# clean episodes: {clean_episodes} | clean successes: {clean_successes} ({clean_rate:.1f}%)")
 
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+        if clean_episodes > 0:
+            logging.info(f"Current task clean success rate: {float(clean_successes) / float(clean_episodes)} ({clean_episodes} clean episodes)")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")

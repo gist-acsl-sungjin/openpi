@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import json
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -285,6 +286,231 @@ class TokenizeFASTInputs(DataTransformFn):
             "tokenized_prompt_mask": token_mask,
             "token_ar_mask": ar_mask,
             "token_loss_mask": loss_mask,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeSSv2Inputs(DataTransformFn):
+    """Tokenizer transform for SS-v2 A2L (Action-to-Language) pre-training.
+
+    Token layout:
+        Prefix (loss_mask=False, ar_mask=0):
+            [BOS] "Describe the action shown across the three frames.\n"
+        Postfix (loss_mask=True, ar_mask=1):
+            "Answer: {target_prompt}" [EOS]
+
+    target_prompt: correct action description (the SS-v2 label).
+    No label is given in the prefix — the model must generate from visual content alone.
+
+    Trivial solution analysis:
+        - No label in input → copying is impossible
+        - Generic outputs ("person doing something") → detectable via ROUGE-L / output diversity
+        - Template memorization → monitor per-template accuracy separately
+    """
+
+    tokenizer: _tokenizer.FASTTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        target_prompt = data.pop("target_prompt", None)
+        data.pop("prompt", None)  # not used in A2L; discard if present
+        if target_prompt is None:
+            raise ValueError("'target_prompt' is required for SSv2 A2L tokenization")
+
+        if not isinstance(target_prompt, str):
+            target_prompt = target_prompt.item()
+
+        target_prompt = target_prompt.lower().strip().replace("_", " ")
+
+        prefix_text = (
+            "You are given three frames from a video in order: "
+            "image 1 (start of action), image 2 (middle of action), image 3 (end of action).\n"
+            "Describe the action shown across the three frames.\n"
+        )
+
+        pg_tok = self.tokenizer._paligemma_tokenizer
+        prefix_tokens = pg_tok.encode(prefix_text, add_bos=True)
+        postfix_tokens = pg_tok.encode(f"Answer: {target_prompt}", add_eos=True)
+
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)
+
+        max_len = self.tokenizer._max_len
+        if len(tokens) < max_len:
+            pad = [False] * (max_len - len(tokens))
+            tokens = tokens + pad
+            token_mask = token_mask + pad
+            ar_mask = ar_mask + pad
+            loss_mask = loss_mask + pad
+        else:
+            tokens = tokens[:max_len]
+            token_mask = token_mask[:max_len]
+            ar_mask = ar_mask[:max_len]
+            loss_mask = loss_mask[:max_len]
+
+        return {
+            **data,
+            "tokenized_prompt": np.asarray(tokens),
+            "tokenized_prompt_mask": np.asarray(token_mask),
+            "token_ar_mask": np.asarray(ar_mask),
+            "token_loss_mask": np.asarray(loss_mask),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class KeepKeys(DataTransformFn):
+    """Run inner transform but preserve specified input keys in the output.
+
+    Useful when an inner transform returns a fresh dict that drops keys
+    that downstream transforms still need.
+    """
+
+    inner: DataTransformFn
+    keep: tuple[str, ...]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        out = dict(self.inner(data))
+        for k in self.keep:
+            if k in data:
+                out[k] = data[k]
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectCoTReasoning(DataTransformFn):
+    """Injects CoT reasoning text from cot_simple.json into the data dict.
+
+    Reads episode_index and frame_index from the data dict, looks up the
+    matching segment in cot_simple.json, and adds a 'reasoning' key containing
+    updated_content_w_instruction.  If no matching segment is found, 'reasoning'
+    is set to an empty string.
+
+    The JSON is keyed by episode index (as string) and has the structure:
+        { "episode_start_interval": [...],
+          "segments": [ { "start_step": int, "end_step": int,
+                          "updated_content_w_instruction": str, ... } ] }
+
+    'end_step == -1' means the segment extends to the end of the episode.
+    """
+
+    cot_json_path: str
+
+    def __post_init__(self) -> None:
+        with open(self.cot_json_path) as f:
+            object.__setattr__(self, "_cot_data", json.load(f))
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # At inference time episode_index / frame_index are not available — skip.
+        if "episode_index" not in data or "frame_index" not in data:
+            return {**data, "reasoning": ""}
+
+        episode_idx = int(data["episode_index"])
+        frame_idx = int(data["frame_index"])
+
+        reasoning = ""
+        ep_data = self._cot_data.get(str(episode_idx))
+        if ep_data is not None:
+            for seg in ep_data["segments"]:
+                end = float("inf") if seg["end_step"] == -1 else seg["end_step"]
+                if seg["start_step"] <= frame_idx < end:
+                    uc_w_inst = seg.get("updated_content_w_instruction")
+                    if uc_w_inst:
+                        # Update segment: reasoning was just revised — use the updated version.
+                        reasoning = uc_w_inst
+                    else:
+                        # Action segment: model acts under the current (possibly outdated) reasoning.
+                        # Use 'content' which holds the reasoning the model is operating under.
+                        content = seg.get("content", "")
+                        reasoning = content if content else ""
+                    break
+
+        return {**data, "reasoning": reasoning}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeFASTCoTInputs(DataTransformFn):
+    """Tokenize pi0-FAST inputs with chain-of-thought reasoning.
+
+    Token layout:
+        Prefix  (ar_mask=0, loss=False):
+            [BOS] "Task: {task}, State: {state};\n"
+        CoT     (ar_mask=1, loss=True):
+            "Reasoning: {reasoning}\n"
+        Action  (ar_mask=1, loss=True):
+            "Action: " + [FAST tokens] + "|" [EOS]
+
+    When reasoning is empty (no CoT segment found), falls back to the
+    standard pi0-FAST layout without the Reasoning prefix.
+    """
+
+    tokenizer: _tokenizer.FASTTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        prompt = data.pop("prompt", None)
+        if prompt is None:
+            raise ValueError("Prompt is required")
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+
+        reasoning = data.pop("reasoning", "")
+        if not isinstance(reasoning, str):
+            reasoning = reasoning.item()
+
+        state, actions = data["state"], data.get("actions")
+
+        pg_tok = self.tokenizer._paligemma_tokenizer
+        cleaned_prompt = prompt.lower().strip().replace("_", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+
+        prefix_text = f"Task: {cleaned_prompt}, State: {state_str};\n"
+        prefix_tokens = pg_tok.encode(prefix_text, add_bos=True)
+
+        # Build postfix: optional reasoning block + action tokens
+        postfix_tokens: list[int] = []
+        if reasoning:
+            postfix_tokens += pg_tok.encode(f"Reasoning: {reasoning}\n")
+
+        if actions is not None:
+            action_tokens = self.tokenizer._fast_tokenizer(actions[None])[0]
+            action_tokens_in_pg = self.tokenizer._act_tokens_to_paligemma_tokens(action_tokens)
+            postfix_tokens += (
+                pg_tok.encode("Action: ")
+                + action_tokens_in_pg.tolist()
+                + pg_tok.encode("|", add_eos=True)
+            )
+
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)
+
+        max_len = self.tokenizer._max_len
+        if len(tokens) < max_len:
+            pad = [False] * (max_len - len(tokens))
+            tokens = tokens + pad
+            token_mask = token_mask + pad
+            ar_mask = ar_mask + pad
+            loss_mask = loss_mask + pad
+        else:
+            if len(tokens) > max_len:
+                import logging
+                logging.warning(
+                    f"CoT token length ({len(tokens)}) exceeds max_len ({max_len}), truncating. "
+                    "Consider increasing max_token_len in your model config."
+                )
+            tokens = tokens[:max_len]
+            token_mask = token_mask[:max_len]
+            ar_mask = ar_mask[:max_len]
+            loss_mask = loss_mask[:max_len]
+
+        return {
+            **data,
+            "tokenized_prompt": np.asarray(tokens),
+            "tokenized_prompt_mask": np.asarray(token_mask),
+            "token_ar_mask": np.asarray(ar_mask),
+            "token_loss_mask": np.asarray(loss_mask),
         }
 
 
